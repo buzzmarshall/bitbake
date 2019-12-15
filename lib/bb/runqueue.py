@@ -2346,7 +2346,13 @@ class RunQueueExecute:
             if tid not in self.pending_migrations:
                 self.pending_migrations.add(tid)
 
-        update_tasks = []
+        #
+        # We have cases where most of the system will see rehashing due to cache matches but the subsequent
+        # hashes won't match, usually due to changes to a core class which means everything has to rerun.
+        # As such we should only migrate a task is its going Valid->Valid, Valid->Invalid or Invalid->Valid
+        # If it was invalid before and is invalid afterwards, we don't need to do all the dependency walking
+        #
+        process_now = []
         for tid in self.pending_migrations.copy():
             if tid in self.runq_running or tid in self.sq_live:
                 # Too late, task already running, not much we can do now
@@ -2362,8 +2368,31 @@ class RunQueueExecute:
                     break
             if not valid:
                 continue
-
+            process_now.append(tid)
             self.pending_migrations.remove(tid)
+
+        origvalid = []
+        for tid in process_now:
+            if tid in self.sqdata.valid:
+                origvalid.append(tid)
+
+            (mc, fn, taskname, taskfn) = split_tid_mcfn(tid)
+            self.sqdata.stamps[tid] = bb.build.stampfile(taskname + "_setscene", self.rqdata.dataCaches[mc], taskfn, noextra=True)
+
+            if tid in self.stampcache:
+                del self.stampcache[tid]
+
+            if tid in self.build_stamps:
+                del self.build_stamps[tid]
+
+        if process_now:
+            self.sqdone = False
+            update_scenequeue_data(set(process_now), self.sqdata, self.rqdata, self.rq, self.cooker, self.stampcache, self, summary=False)
+        for tid in process_now.copy():
+            if tid not in self.sqdata.valid and not origvalid:
+                process_now.remove(tid)
+
+        for tid in process_now:
             changed = True
 
             if tid in self.tasks_scenequeue_done:
@@ -2403,22 +2432,6 @@ class RunQueueExecute:
             if tid in self.scenequeue_notneeded:
                 self.scenequeue_notneeded.remove(tid)
 
-            (mc, fn, taskname, taskfn) = split_tid_mcfn(tid)
-            self.sqdata.stamps[tid] = bb.build.stampfile(taskname + "_setscene", self.rqdata.dataCaches[mc], taskfn, noextra=True)
-
-            if tid in self.stampcache:
-                del self.stampcache[tid]
-
-            if tid in self.build_stamps:
-                del self.build_stamps[tid]
-
-            update_tasks.append((tid, harddepfail, tid in self.sqdata.valid))
-
-        if update_tasks:
-            self.sqdone = False
-            update_scenequeue_data([t[0] for t in update_tasks], self.sqdata, self.rqdata, self.rq, self.cooker, self.stampcache, self, summary=False)
-
-        for (tid, harddepfail, origvalid) in update_tasks:
             if tid in self.sqdata.valid and not origvalid:
                 logger.info("Setscene task %s became valid" % tid)
             if harddepfail:
